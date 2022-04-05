@@ -1,3 +1,13 @@
+*   Fix transaction target for `has_many through:` relations across multiple database connections
+
+    `has_many_through` associations now use the connection of the through ActiveRecord
+    model to create/reuse already open transactions. As a result creating multiple through
+    records now only requires one transaction. This fixes transactions on multi database setups
+    where the through model and the receiving model in the many-to-many relationship reside on
+    different databases.
+
+    *Stefan Joest*
+
 *   Remove `ActiveRecord.legacy_connection_handling`.
 
     *Eileen M. Uchitelle*
