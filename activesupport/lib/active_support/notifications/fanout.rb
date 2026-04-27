@@ -59,6 +59,7 @@ module ActiveSupport
         @other_subscribers = []
         @all_listeners_for = Concurrent::Map.new
         @groups_for = Concurrent::Map.new
+        @dispatch_plans = Concurrent::Map.new
       end
 
       def inspect # :nodoc:
@@ -114,9 +115,11 @@ module ActiveSupport
         if key
           @all_listeners_for.delete(key)
           @groups_for.delete(key)
+          @dispatch_plans.delete(key)
         else
           @all_listeners_for.clear
           @groups_for.clear
+          @dispatch_plans.clear
         end
       end
 
@@ -220,6 +223,46 @@ module ActiveSupport
         groups
       end
 
+      # A +DispatchPlan+ is a pre-resolved, cached representation of which
+      # subscribers should be notified for a given event name. It avoids
+      # allocating Handle, Group, and intermediate Array objects on every
+      # +instrument+ call.
+      #
+      # Silenceable subscribers (e.g. LogSubscriber) are checked at dispatch
+      # time via +silenced?+, since their state can change between calls.
+      class DispatchPlan # :nodoc:
+        attr_reader :monotonic_timed, :timed, :evented, :event_object,
+                    :silenceable_monotonic_timed, :silenceable_timed,
+                    :silenceable_evented, :silenceable_event_object
+
+        def initialize(monotonic_timed, timed, evented, event_object,
+                       silenceable_monotonic_timed, silenceable_timed,
+                       silenceable_evented, silenceable_event_object)
+          @monotonic_timed = monotonic_timed
+          @timed = timed
+          @evented = evented
+          @event_object = event_object
+          @silenceable_monotonic_timed = silenceable_monotonic_timed
+          @silenceable_timed = silenceable_timed
+          @silenceable_evented = silenceable_evented
+          @silenceable_event_object = silenceable_event_object
+        end
+
+        def empty?
+          @monotonic_timed.nil? && @timed.nil? && @evented.nil? && @event_object.nil? &&
+            @silenceable_monotonic_timed.nil? && @silenceable_timed.nil? &&
+            @silenceable_evented.nil? && @silenceable_event_object.nil?
+        end
+
+        EMPTY = new(nil, nil, nil, nil, nil, nil, nil, nil).freeze
+      end
+
+      def dispatch_plan_for(name) # :nodoc:
+        @dispatch_plans.compute_if_absent(name) do
+          build_dispatch_plan(name)
+        end
+      end
+
       # A +Handle+ is used to record the start and finish time of event.
       #
       # Both #start and #finish must each be called exactly once.
@@ -290,7 +333,7 @@ module ActiveSupport
 
       include FanoutIteration
 
-      def build_handle(name, id, payload)
+      def build_handle(name, id, payload) # :nodoc:
         groups = groups_for(name).map do |group_klass, grouped_listeners|
           group_klass.new(grouped_listeners, name, id, payload)
         end
@@ -343,6 +386,64 @@ module ActiveSupport
       # This is a sync queue, so there is no waiting.
       def wait
       end
+
+      private
+        def build_dispatch_plan(name)
+          listeners = all_listeners_for(name)
+          return DispatchPlan::EMPTY if listeners.empty?
+
+          monotonic_timed = nil
+          timed = nil
+          evented = nil
+          event_object = nil
+          silenceable_monotonic_timed = nil
+          silenceable_timed = nil
+          silenceable_evented = nil
+          silenceable_event_object = nil
+
+          listeners.each do |listener|
+            delegate = listener.delegate
+
+            if listener.silenceable
+              case listener
+              when Subscribers::MonotonicTimed
+                (silenceable_monotonic_timed ||= []) << delegate
+              when Subscribers::Timed
+                (silenceable_timed ||= []) << delegate
+              when Subscribers::EventObject
+                (silenceable_event_object ||= []) << delegate
+              when Subscribers::Evented
+                (silenceable_evented ||= []) << delegate
+              end
+            else
+              case listener
+              when Subscribers::MonotonicTimed
+                (monotonic_timed ||= []) << delegate
+              when Subscribers::Timed
+                (timed ||= []) << delegate
+              when Subscribers::EventObject
+                (event_object ||= []) << delegate
+              when Subscribers::Evented
+                (evented ||= []) << delegate
+              end
+            end
+          end
+
+          monotonic_timed&.freeze
+          timed&.freeze
+          evented&.freeze
+          event_object&.freeze
+          silenceable_monotonic_timed&.freeze
+          silenceable_timed&.freeze
+          silenceable_evented&.freeze
+          silenceable_event_object&.freeze
+
+          DispatchPlan.new(
+            monotonic_timed, timed, evented, event_object,
+            silenceable_monotonic_timed, silenceable_timed,
+            silenceable_evented, silenceable_event_object
+          ).freeze
+        end
 
       module Subscribers # :nodoc:
         def self.new(pattern, listener, monotonic)
