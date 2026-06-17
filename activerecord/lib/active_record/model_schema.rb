@@ -559,6 +559,7 @@ module ActiveRecord
 
         reload_schema_from_cache
         initialize_find_by_cache
+        clear_query_shape_cache!
       end
 
       # Load the model's schema information either from the schema cache

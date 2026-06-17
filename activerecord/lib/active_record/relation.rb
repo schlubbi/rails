@@ -1476,7 +1476,11 @@ module ActiveRecord
             end
           else
             model.with_connection do |c|
-              model._query_by_sql(c, arel, async: async)
+              if model.query_shape_cache_enabled?
+                _exec_with_shape_cache(c, async: async)
+              else
+                model._query_by_sql(c, arel, async: async)
+              end
             end
           end
         end
@@ -1490,6 +1494,31 @@ module ActiveRecord
           records
         else
           model._load_from_sql(rows, &block).freeze
+        end
+      end
+
+      def _exec_with_shape_cache(connection, async: false)
+        cache = model.query_shape_cache_store
+        result = cache.lookup(self)
+
+        if result
+          # Cache hit — skip build_arel + to_sql_and_binds
+          entry, binds = result
+          connection.select_all(
+            entry.sql,
+            "#{model.name} Load",
+            binds,
+            preparable: entry.preparable,
+            async: async,
+            allow_retry: entry.retryable
+          )
+        else
+          # Cache miss — execute normally, then record
+          the_arel = arel
+          sql_result = connection.to_sql_and_binds(the_arel)
+          sql, _binds, preparable, retryable = sql_result
+          cache.record(self, sql, preparable, retryable)
+          model._query_by_sql(connection, the_arel, async: async)
         end
       end
 

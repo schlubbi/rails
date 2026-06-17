@@ -67,6 +67,7 @@ module ActiveRecord
   autoload :NoTouching
   autoload :Persistence
   autoload :QueryCache
+  autoload :QueryShapeCache
   autoload :QueryLogs
   autoload :Querying
   autoload :ReadonlyAttributes

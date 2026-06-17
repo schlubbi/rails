@@ -266,6 +266,22 @@ module ActiveRecord
         @find_by_statement_cache = { true => Concurrent::Map.new, false => Concurrent::Map.new }
       end
 
+      def query_shape_cache_enabled? # :nodoc:
+        !!@query_shape_cache_enabled
+      end
+
+      def query_shape_cache_enabled=(value) # :nodoc:
+        @query_shape_cache_enabled = value
+      end
+
+      def query_shape_cache_store # :nodoc:
+        @query_shape_cache_store ||= QueryShapeCache.new
+      end
+
+      def clear_query_shape_cache! # :nodoc:
+        @query_shape_cache_store&.clear!
+      end
+
       def find(*ids) # :nodoc:
         # We don't have cache keys for this stuff yet
         return super unless ids.length == 1
