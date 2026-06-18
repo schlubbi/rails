@@ -245,6 +245,7 @@ module ActiveRecord
 
         def reload_schema_from_cache(*) # :nodoc:
           @finder_needs_type_condition = nil
+          @_sti_subclasses = nil
           if @_new_optimized
             singleton_class.remove_method(:new)
             @_new_optimized = false
@@ -336,11 +337,19 @@ module ActiveRecord
           type_name = base_class.type_for_attribute(inheritance_column).cast(type_name)
           subclass = sti_class_for(type_name)
 
-          unless subclass == self || descendants.include?(subclass)
+          unless subclass == self || _sti_subclass?(subclass)
             raise SubclassNotFound, "Invalid single-table inheritance type: #{subclass.name} is not a subclass of #{name}"
           end
 
           subclass
+        end
+
+        def _sti_subclass?(klass)
+          @_sti_subclasses ||= {}
+          unless @_sti_subclasses.key?(klass)
+            @_sti_subclasses[klass] = descendants.include?(klass)
+          end
+          @_sti_subclasses[klass]
         end
 
         def type_condition(table = arel_table)

@@ -19,18 +19,42 @@ module ActiveModel
   end
 
   class LazyAttributeSet < AttributeSet # :nodoc:
-    def initialize(values, types, additional_types, default_attributes, attributes = {})
+    EMPTY_HASH = {}.freeze
+    private_constant :EMPTY_HASH
+
+    def initialize(values, types, additional_types, default_attributes, attributes = EMPTY_HASH)
       super(attributes)
       @values = values
       @types = types
       @additional_types = additional_types
       @default_attributes = default_attributes
-      @casted_values = {}
+      @casted_values = EMPTY_HASH
       @materialized = false
+      @has_additional_types = !additional_types.empty?
     end
 
     def key?(name)
       (values.key?(name) || types.key?(name) || @attributes.key?(name)) && self[name].initialized?
+    end
+
+    def []=(name, value)
+      @attributes = {} if @attributes.frozen?
+      @attributes[name] = value
+    end
+
+    def write_from_database(name, value)
+      @attributes = {} if @attributes.frozen?
+      super
+    end
+
+    def write_from_user(name, value)
+      @attributes = {} if @attributes.frozen?
+      super
+    end
+
+    def write_cast_value(name, value)
+      @attributes = {} if @attributes.frozen?
+      super
     end
 
     def keys
@@ -48,7 +72,8 @@ module ActiveModel
         value = values.fetch(name) { value_present = false }
 
         if value_present
-          type = additional_types.fetch(name, types[name])
+          type = @has_additional_types ? additional_types.fetch(name, types[name]) : types[name]
+          @casted_values = {} if @casted_values.frozen?
           @casted_values[name] = type.deserialize(value)
         else
           attr = default_attribute(name, value_present, value)
@@ -75,14 +100,17 @@ module ActiveModel
         value_present = true,
         value = values.fetch(name) { value_present = false }
       )
-        type = additional_types.fetch(name, types[name])
+        type = @has_additional_types ? additional_types.fetch(name, types[name]) : types[name]
 
         if value_present
+          @attributes = {} if @attributes.frozen?
           @attributes[name] = Attribute.from_database(name, value, type, @casted_values[name])
         elsif types.key?(name)
           if attr = default_attributes[name]
+            @attributes = {} if @attributes.frozen?
             @attributes[name] = attr.dup
           else
+            @attributes = {} if @attributes.frozen?
             @attributes[name] = Attribute.uninitialized(name, type)
           end
         else

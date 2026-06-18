@@ -3,8 +3,11 @@
 module ActiveRecord
   # See ActiveRecord::Aggregations::ClassMethods for documentation
   module Aggregations
+    EMPTY_AGGREGATION_CACHE = {}.freeze
+    private_constant :EMPTY_AGGREGATION_CACHE
+
     def initialize_dup(*) # :nodoc:
-      @aggregation_cache = @aggregation_cache.dup
+      @aggregation_cache = @aggregation_cache.dup unless @aggregation_cache.frozen?
       super
     end
 
@@ -15,12 +18,16 @@ module ActiveRecord
 
     private
       def clear_aggregation_cache
-        @aggregation_cache.clear if persisted?
+        return unless persisted?
+        if @aggregation_cache.frozen?
+          return # already empty
+        end
+        @aggregation_cache.clear
       end
 
       def init_internals
         super
-        @aggregation_cache = {}
+        @aggregation_cache = EMPTY_AGGREGATION_CACHE
       end
 
       # = Active Record \Aggregations
@@ -252,6 +259,7 @@ module ActiveRecord
                 object = constructor.respond_to?(:call) ?
                   constructor.call(*attrs) :
                   class_name.constantize.send(constructor, *attrs)
+                @aggregation_cache = {} if @aggregation_cache.frozen?
                 @aggregation_cache[name] = object.freeze
               end
               @aggregation_cache[name]
@@ -275,9 +283,11 @@ module ActiveRecord
 
               if part.nil? && allow_nil
                 mapping.each { |key, _| write_attribute(key, nil) }
+                @aggregation_cache = {} if @aggregation_cache.frozen?
                 @aggregation_cache[name] = nil
               else
                 mapping.each { |key, value| write_attribute(key, part.send(value)) }
+                @aggregation_cache = {} if @aggregation_cache.frozen?
                 @aggregation_cache[name] = part.dup.freeze
               end
             end

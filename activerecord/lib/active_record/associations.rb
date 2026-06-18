@@ -64,6 +64,9 @@ module ActiveRecord
       association
     end
 
+    EMPTY_ASSOCIATION_CACHE = {}.freeze
+    private_constant :EMPTY_ASSOCIATION_CACHE
+
     def association_cached?(name) # :nodoc:
       @association_cache.key?(name)
     end
@@ -76,16 +79,18 @@ module ActiveRecord
     private
       def init_internals
         super
-        @association_cache = {}
+        @association_cache = EMPTY_ASSOCIATION_CACHE
       end
 
       # Returns the specified association instance if it exists, +nil+ otherwise.
       def association_instance_get(name)
-        (@association_cache ||= {})[name]
+        (@association_cache ||= EMPTY_ASSOCIATION_CACHE)[name]
       end
 
       # Set the specified association instance.
       def association_instance_set(name, association)
+        cache = (@association_cache ||= EMPTY_ASSOCIATION_CACHE)
+        @association_cache = {} if cache.frozen?
         @association_cache[name] = association
       end
 

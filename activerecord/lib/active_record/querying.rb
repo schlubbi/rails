@@ -98,10 +98,22 @@ module ActiveRecord
 
       message_bus.instrument("instantiation.active_record", payload) do
         if result_set.includes_column?(inheritance_column)
-          result_set.indexed_rows.map { |record| instantiate(record, column_types, &block) }
+          sti_class_cache = {}
+          sti_builder_cache = {}
+          result_set.indexed_rows.map do |record|
+            type_value = record[inheritance_column]
+            klass = (sti_class_cache[type_value] ||= discriminate_class_for_record(record))
+            builder = (sti_builder_cache[klass] ||= klass.attributes_builder)
+            attrs = builder.build_from_database(record, column_types)
+            klass.allocate.init_with_attributes(attrs, &block)
+          end
         else
-          # Instantiate a homogeneous set
-          result_set.indexed_rows.map { |record| instantiate_instance_of(self, record, column_types, &block) }
+          # Instantiate a homogeneous set — inline for reduced dispatch overhead
+          builder = attributes_builder
+          result_set.indexed_rows.map do |record|
+            attrs = builder.build_from_database(record, column_types)
+            allocate.init_with_attributes(attrs, &block)
+          end
         end
       end
     end
