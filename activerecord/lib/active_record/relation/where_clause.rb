@@ -68,8 +68,28 @@ module ActiveRecord
       end
 
       def ast
-        predicates = predicates_with_wrapped_sql_literals
-        predicates.one? ? predicates.first : Arel::Nodes::And.new(predicates)
+        preds = predicates
+        # Fast path: when all predicates are Arel nodes (no raw SQL strings),
+        # skip the wrapping/filtering that predicates_with_wrapped_sql_literals does
+        needs_wrapping = false
+        has_empty = false
+        preds.each do |node|
+          case node
+          when Arel::Nodes::SqlLiteral, ::String
+            if node == ""
+              has_empty = true
+            else
+              needs_wrapping = true
+            end
+            break if needs_wrapping
+          end
+        end
+
+        if needs_wrapping || has_empty
+          preds = predicates_with_wrapped_sql_literals
+        end
+
+        preds.one? ? preds.first : Arel::Nodes::And.new(preds)
       end
 
       def ==(other)
@@ -113,9 +133,9 @@ module ActiveRecord
         attrs
       end
 
-      protected
         attr_reader :predicates
 
+      protected
         def referenced_columns
           hash = {}
           each_attributes { |attr, node| hash[attr] = node }

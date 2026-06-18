@@ -26,14 +26,19 @@ module ActiveRecord
     end
 
     def self.references(attributes)
-      attributes.each_with_object([]) do |(key, value), result|
+      result = nil
+      attributes.each do |key, value|
         if value.is_a?(Hash)
-          result << Arel.sql(key, retryable: true)
-        elsif (idx = key.rindex("."))
-          result << Arel.sql(key[0, idx], retryable: true)
+          key = key.name if key.is_a?(Symbol)
+          (result ||= []) << Arel::Nodes::SqlLiteral.new(key, retryable: true)
+        elsif key.is_a?(String) && (idx = key.rindex("."))
+          (result ||= []) << Arel::Nodes::SqlLiteral.new(key[0, idx], retryable: true)
         end
       end
+      result || EMPTY_ARRAY
     end
+
+    EMPTY_ARRAY = [].freeze
 
     # Define how a class is converted to Arel nodes when passed to +where+.
     # The handler can be any object that responds to +call+, and will be used
@@ -56,8 +61,10 @@ module ActiveRecord
 
     def build(attribute, value, operator = nil)
       value = value.id if value.respond_to?(:id)
-      if operator ||= table.type(attribute.name).force_equality?(value) && :eq
-        bind = build_bind_attribute(attribute.name, value)
+      attr_name = attribute.name
+      type = table.type(attr_name)
+      if operator ||= type.force_equality?(value) && :eq
+        bind = Relation::QueryAttribute.new(attr_name, value, type)
         attribute.public_send(operator, bind)
       else
         handler_for(value).call(attribute, value)
@@ -82,7 +89,18 @@ module ActiveRecord
       attr_writer :table
 
       def expand_from_hash(attributes, &block)
-        return [Arel.sql("1=0", retryable: true)] if attributes.empty?
+        return [Arel::Nodes::SqlLiteral.new("1=0", retryable: true)] if attributes.empty?
+
+        # Fast path: single simple key-value pair with a known column
+        # Skips flat_map and association/aggregation checks
+        if attributes.size == 1
+          attributes.each do |key, value|
+            if !key.is_a?(Array) && !value.is_a?(Hash)
+              col = key.is_a?(Symbol) ? key.name : key
+              return [self[key, value]] if table.has_column?(col)
+            end
+          end
+        end
 
         attributes.flat_map do |key, value|
           if key.is_a?(Array) && key.size == 1
@@ -163,6 +181,16 @@ module ActiveRecord
       end
 
       def convert_dot_notation_to_hash(attributes)
+        # Fast path: if no keys contain dots or hash values, return as-is
+        needs_conversion = false
+        attributes.each do |key, value|
+          if value.is_a?(Hash) || (key.is_a?(String) && key.include?("."))
+            needs_conversion = true
+            break
+          end
+        end
+        return attributes unless needs_conversion
+
         attributes.each_with_object({}) do |(key, value), converted|
           if value.is_a?(Hash)
             if (existing = converted[key])

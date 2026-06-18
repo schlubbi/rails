@@ -6,10 +6,13 @@ module Arel # :nodoc: all
       attr_reader :cores
       attr_accessor :limit, :orders, :lock, :offset, :with
 
+      EMPTY_ORDERS = [].freeze
+      private_constant :EMPTY_ORDERS
+
       def initialize(relation = nil)
         super()
         @cores          = [SelectCore.new(relation)]
-        @orders         = []
+        @orders         = EMPTY_ORDERS
         @limit          = nil
         @lock           = nil
         @offset         = nil
@@ -19,7 +22,7 @@ module Arel # :nodoc: all
       def initialize_copy(other)
         super
         @cores  = @cores.map { |x| x.clone }
-        @orders = @orders.map { |x| x.clone }
+        @orders = @orders.map { |x| x.clone } unless @orders.frozen?
       end
 
       def hash

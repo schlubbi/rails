@@ -1219,13 +1219,11 @@ module ActiveRecord
 
     def reset
       @future_result&.cancel
-      @future_result = nil
-      @delegate_to_model = false
-      @to_sql = @arel = @loaded = @should_eager_load = nil
-      @offsets = @take = nil
-      @cache_keys = nil
-      @cache_versions = nil
-      @records = nil
+      @future_result = @delegate_to_model =
+        @to_sql = @arel = @loaded = @should_eager_load =
+        @offsets = @take =
+        @cache_keys = @cache_versions =
+        @records = nil
       self
     end
 
@@ -1241,7 +1239,7 @@ module ActiveRecord
         end
       else
         model.with_connection do |conn|
-          conn.unprepared_statement { conn.to_sql(arel) }
+          conn.unprepared_statement { conn.compile_sql(arel) }
         end
       end
     end

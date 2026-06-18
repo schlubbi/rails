@@ -51,6 +51,7 @@ module Arel
   # The +:retryable+ option can be used to mark the SQL as safe to retry.
   # Use this option only if the SQL is idempotent, as it could be executed
   # more than once.
+  # Fast path for the common case: Arel.sql(string) or Arel.sql(string, retryable: true/false)
   def self.sql(sql_string, *positional_binds, retryable: false, **named_binds)
     if Arel::Nodes::SqlLiteral === sql_string
       sql_string
@@ -61,8 +62,11 @@ module Arel
     end
   end
 
+  FROZEN_STAR = Arel::Nodes::SqlLiteral.new("*", retryable: true).freeze
+  private_constant :FROZEN_STAR
+
   def self.star # :nodoc:
-    sql("*", retryable: true)
+    FROZEN_STAR
   end
 
   def self.arel_node?(value) # :nodoc:

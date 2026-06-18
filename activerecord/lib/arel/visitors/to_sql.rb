@@ -814,15 +814,12 @@ module Arel # :nodoc: all
           end
 
           if o.positional_binds
-            o.sql_with_placeholders.scan(/\?|([^?]+)/) do
-              if $1
-                collector << $1
-              else
-                value = o.positional_binds[bind_index]
-                bind_index += 1
-
-                new_bind.call(value)
-              end
+            segments = o.sql_segments
+            collector << segments[0] unless segments[0].empty?
+            o.positional_binds.each_with_index do |value, i|
+              new_bind.call(value)
+              seg = segments[i + 1]
+              collector << seg if seg && !seg.empty?
             end
           else
             o.sql_with_placeholders.scan(/:(?<!::)([a-zA-Z]\w*)|([^:]+|.)/) do

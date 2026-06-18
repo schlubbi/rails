@@ -84,7 +84,12 @@ module Arel # :nodoc: all
           column = Nodes::SqlLiteral.new(column.name)
         end
 
-        @ctx.groups.push Nodes::Group.new column
+        groups = @ctx.groups
+        if groups.frozen?
+          @ctx.groups = [Nodes::Group.new(column)]
+        else
+          groups.push Nodes::Group.new column
+        end
       end
       self
     end
@@ -94,7 +99,12 @@ module Arel # :nodoc: all
 
       case table
       when Nodes::Join
-        @ctx.source.right << table
+        right = @ctx.source.right
+        if right.frozen?
+          @ctx.source.right = [table]
+        else
+          right << table
+        end
       else
         @ctx.source.left = table
       end
@@ -115,7 +125,13 @@ module Arel # :nodoc: all
         klass = Nodes::StringJoin
       end
 
-      @ctx.source.right << create_join(relation, nil, klass)
+      right = @ctx.source.right
+      join = create_join(relation, nil, klass)
+      if right.frozen?
+        @ctx.source.right = [join]
+      else
+        right << join
+      end
       self
     end
 
@@ -124,22 +140,41 @@ module Arel # :nodoc: all
     end
 
     def having(expr)
-      @ctx.havings << expr
+      havings = @ctx.havings
+      if havings.frozen?
+        @ctx.havings = [expr]
+      else
+        havings << expr
+      end
       self
     end
 
     def window(name)
       window = Nodes::NamedWindow.new(name)
-      @ctx.windows.push window
+      windows = @ctx.windows
+      if windows.frozen?
+        @ctx.windows = [window]
+      else
+        windows.push window
+      end
       window
     end
 
     def project(*projections)
       # FIXME: converting these to SQLLiterals is probably not good, but
       # rails tests require it.
-      @ctx.projections.concat projections.map { |x|
-        STRING_OR_SYMBOL_CLASS.include?(x.class) ? Nodes::SqlLiteral.new(x.to_s) : x
-      }
+      needs_conversion = false
+      projections.each { |x| if STRING_OR_SYMBOL_CLASS.include?(x.class); needs_conversion = true; break; end }
+      if needs_conversion
+        projections = projections.map { |x|
+          STRING_OR_SYMBOL_CLASS.include?(x.class) ? Nodes::SqlLiteral.new(x.to_s) : x
+        }
+      end
+      if @ctx.projections.frozen?
+        @ctx.projections = projections
+      else
+        @ctx.projections.concat projections
+      end
       self
     end
 
@@ -178,9 +213,16 @@ module Arel # :nodoc: all
 
     def order(*expr)
       # FIXME: We SHOULD NOT be converting these to SqlLiteral automatically
-      @ast.orders.concat expr.map { |x|
+      needs_conversion = false
+      expr.each { |x| if STRING_OR_SYMBOL_CLASS.include?(x.class); needs_conversion = true; break; end }
+      orders = needs_conversion ? expr.map { |x|
         STRING_OR_SYMBOL_CLASS.include?(x.class) ? Nodes::SqlLiteral.new(x.to_s) : x
-      }
+      } : expr
+      if @ast.orders.frozen?
+        @ast.orders = orders
+      else
+        @ast.orders.concat orders
+      end
       self
     end
 
@@ -192,7 +234,11 @@ module Arel # :nodoc: all
       if Arel::TreeManager === expr
         expr = expr.ast
       end
-      @ctx.wheres << expr
+      if @ctx.wheres.frozen?
+        @ctx.wheres = [expr]
+      else
+        @ctx.wheres << expr
+      end
       self
     end
 
@@ -249,7 +295,11 @@ module Arel # :nodoc: all
     alias limit= take
 
     def join_sources
-      @ctx.source.right
+      right = @ctx.source.right
+      if right.frozen?
+        @ctx.source.right = right = []
+      end
+      right
     end
 
     def source

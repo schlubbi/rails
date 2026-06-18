@@ -6,6 +6,9 @@ module Arel # :nodoc: all
       attr_accessor :projections, :wheres, :groups, :windows, :comment
       attr_accessor :havings, :source, :set_quantifier, :optimizer_hints
 
+      EMPTY_ARRAY = [].freeze
+      private_constant :EMPTY_ARRAY
+
       def initialize(relation = nil)
         super()
         @source = JoinSource.new(relation)
@@ -13,11 +16,11 @@ module Arel # :nodoc: all
         # https://ronsavage.github.io/SQL/sql-92.bnf.html#set%20quantifier
         @set_quantifier  = nil
         @optimizer_hints = nil
-        @projections     = []
-        @wheres          = []
-        @groups          = []
-        @havings         = []
-        @windows         = []
+        @projections     = EMPTY_ARRAY
+        @wheres          = EMPTY_ARRAY
+        @groups          = EMPTY_ARRAY
+        @havings         = EMPTY_ARRAY
+        @windows         = EMPTY_ARRAY
         @comment         = nil
       end
 
@@ -35,11 +38,11 @@ module Arel # :nodoc: all
       def initialize_copy(other)
         super
         @source      = @source.clone if @source
-        @projections = @projections.clone
-        @wheres      = @wheres.clone
-        @groups      = @groups.clone
-        @havings     = @havings.clone
-        @windows     = @windows.clone
+        @projections = @projections.clone unless @projections.frozen?
+        @wheres      = @wheres.clone unless @wheres.frozen?
+        @groups      = @groups.clone unless @groups.frozen?
+        @havings     = @havings.clone unless @havings.frozen?
+        @windows     = @windows.clone unless @windows.frozen?
       end
 
       def hash

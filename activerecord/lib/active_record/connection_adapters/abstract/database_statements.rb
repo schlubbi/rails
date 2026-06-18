@@ -10,8 +10,38 @@ module ActiveRecord
 
       # Converts an arel AST to SQL
       def to_sql(arel_or_sql_string, binds = [])
-        sql, _ = to_sql_and_binds(arel_or_sql_string, binds)
-        sql
+        if binds.empty?
+          compile_sql(arel_or_sql_string)
+        else
+          sql, _ = to_sql_and_binds(arel_or_sql_string, binds)
+          sql
+        end
+      end
+
+      # Compile an Arel AST or SQL string to SQL without creating a tuple.
+      # This is a fast path for Relation#to_sql where we only need the SQL string.
+      def compile_sql(arel_or_sql_string) # :nodoc:
+        if arel_or_sql_string.respond_to?(:ast)
+          arel_or_sql_string = arel_or_sql_string.ast
+        end
+
+        if Arel.arel_node?(arel_or_sql_string) && !(String === arel_or_sql_string)
+          collector = collector()
+          collector.retryable = true
+
+          if prepared_statements
+            collector.preparable = true
+            sql, binds = visitor.compile(arel_or_sql_string, collector)
+            if binds.length > bind_params_length
+              return unprepared_statement { compile_sql(arel_or_sql_string) }
+            end
+            sql.freeze
+          else
+            visitor.compile(arel_or_sql_string, collector).freeze
+          end
+        else
+          arel_or_sql_string.frozen? ? arel_or_sql_string : arel_or_sql_string.dup.freeze
+        end
       end
 
       def to_sql_and_binds(arel_or_sql_string, binds = [], preparable = nil, allow_retry = false) # :nodoc:

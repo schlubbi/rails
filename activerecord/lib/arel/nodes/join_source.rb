@@ -8,7 +8,10 @@ module Arel # :nodoc: all
     #   https://www.sqlite.org/syntaxdiagrams.html#join-source
 
     class JoinSource < Arel::Nodes::Binary
-      def initialize(single_source, joinop = [])
+      EMPTY_ARRAY = [].freeze
+      private_constant :EMPTY_ARRAY
+
+      def initialize(single_source, joinop = EMPTY_ARRAY)
         super
       end
 

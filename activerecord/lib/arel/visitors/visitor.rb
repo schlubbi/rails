@@ -26,11 +26,7 @@ module Arel # :nodoc: all
 
         def visit(object, collector = nil)
           dispatch_method = dispatch[object.class]
-          if collector
-            send dispatch_method, object, collector
-          else
-            send dispatch_method, object
-          end
+          send dispatch_method, object, collector
         rescue NoMethodError => e
           raise e if respond_to?(dispatch_method, true)
           superklass = object.class.ancestors.find { |klass|

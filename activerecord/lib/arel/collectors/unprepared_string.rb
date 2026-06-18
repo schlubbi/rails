@@ -2,18 +2,25 @@
 
 module Arel # :nodoc: all
   module Collectors
-    class SubstituteBinds
+    # Combined collector for unprepared statements.
+    # Merges SubstituteBinds + SQLString into a single object to avoid
+    # two allocations and delegation overhead per query.
+    class UnpreparedString
       attr_accessor :preparable, :retryable
 
-      def initialize(quoter, delegate_collector)
+      def initialize(quoter)
         @quoter = quoter
-        @delegate = delegate_collector
-        @str = delegate_collector.instance_variable_get(:@str)
+        @str = +""
+        @bind_index = 1
       end
 
       def <<(str)
         @str << str
         self
+      end
+
+      def value
+        @str
       end
 
       def add_bind(bind, &)
@@ -26,13 +33,6 @@ module Arel # :nodoc: all
         @str << binds.map { |bind| @quoter.quote(bind) }.join(", ")
         self
       end
-
-      def value
-        @str
-      end
-
-      private
-        attr_reader :quoter
     end
   end
 end

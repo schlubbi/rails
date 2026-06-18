@@ -426,7 +426,12 @@ module ActiveRecord
     end
 
     def _select!(*fields) # :nodoc:
-      self.select_values |= fields
+      if @values.key?(:select)
+        self.select_values |= fields
+      else
+        assert_modifiable!
+        @values[:select] = fields
+      end
       self
     end
 
@@ -663,7 +668,12 @@ module ActiveRecord
     # Same as #order but operates on relation in-place instead of copying.
     def order!(*args) # :nodoc:
       preprocess_order_args(args) unless args.empty?
-      self.order_values |= args
+      if @values.key?(:order)
+        self.order_values |= args
+      else
+        assert_modifiable!
+        @values[:order] = args
+      end
       self
     end
 
@@ -1097,15 +1107,34 @@ module ActiveRecord
     def where(*args)
       if args.empty?
         WhereChain.new(spawn)
-      elsif args.length == 1 && args.first.blank?
-        self
+      elsif args.length == 1
+        return self if args.first.blank?
+        spawn.where!(args.first)
       else
-        spawn.where!(*args)
+        spawn.where_with_rest!(args)
       end
     end
 
-    def where!(opts, *rest) # :nodoc:
-      self.where_clause += build_where_clause(opts, rest)
+    def where!(opts, rest = nil) # :nodoc:
+      existing = @values[:where]
+      if existing
+        @values[:where] = Relation::WhereClause.new(existing.predicates + build_where_predicates(opts, rest))
+      else
+        assert_modifiable!
+        @values[:where] = build_where_clause(opts, rest)
+      end
+      self
+    end
+
+    def where_with_rest!(args) # :nodoc:
+      opts = args.shift
+      existing = @values[:where]
+      if existing
+        @values[:where] = Relation::WhereClause.new(existing.predicates + build_where_predicates(opts, args))
+      else
+        assert_modifiable!
+        @values[:where] = build_where_clause(opts, args)
+      end
       self
     end
 
@@ -1683,7 +1712,11 @@ module ActiveRecord
         end
       end
 
-      def build_where_clause(opts, rest = []) # :nodoc:
+      def build_where_clause(opts, rest = nil) # :nodoc:
+        Relation::WhereClause.new(build_where_predicates(opts, rest))
+      end
+
+      def build_where_predicates(opts, rest = nil)
         opts = sanitize_forbidden_attributes(opts)
 
         if opts.is_a?(Array)
@@ -1692,37 +1725,48 @@ module ActiveRecord
 
         case opts
         when String
-          if rest.empty?
-            parts = [Arel.sql(opts)]
+          if rest.nil? || rest.empty?
+            [Arel.sql(opts)]
           elsif rest.first.is_a?(Hash) && /:\w+/.match?(opts)
-            parts = [build_named_bound_sql_literal(opts, rest.first)]
+            [build_named_bound_sql_literal(opts, rest.first)]
           elsif opts.include?("?")
-            parts = [build_bound_sql_literal(opts, rest)]
+            [build_bound_sql_literal(opts, rest)]
           else
-            parts = [Arel.sql(model.sanitize_sql([opts, *rest]))]
+            [Arel.sql(model.sanitize_sql([opts, *rest]))]
           end
         when Hash
-          opts = opts.transform_keys do |key|
-            if key.is_a?(Array)
-              key.map { |k| model.attribute_aliases[k.to_s] || k.to_s }
-            else
-              key = key.to_s
-              model.attribute_aliases[key] || key
+          # Fast path: skip transform_keys when all keys are symbols and no aliases
+          aliases = model.attribute_aliases
+          needs_transform = !aliases.empty?
+          unless needs_transform
+            opts.each_key do |key|
+              if key.is_a?(Array) || key.is_a?(String)
+                needs_transform = true
+                break
+              end
+            end
+          end
+          if needs_transform
+            opts = opts.transform_keys do |key|
+              if key.is_a?(Array)
+                key.map { |k| aliases[k.to_s] || k.to_s }
+              else
+                key = key.to_s
+                aliases[key] || key
+              end
             end
           end
           references = PredicateBuilder.references(opts)
           self.references_values |= references unless references.empty?
 
-          parts = predicate_builder.build_from_hash(opts) do |table_name|
+          predicate_builder.build_from_hash(opts) do |table_name|
             lookup_table_klass_from_join_dependencies(table_name)
           end
         when Arel::Nodes::Node
-          parts = [opts]
+          [opts]
         else
           raise ArgumentError, "Unsupported argument type: #{opts} (#{opts.class})"
         end
-
-        Relation::WhereClause.new(parts)
       end
       alias :build_having_clause :build_where_clause
 
@@ -1821,24 +1865,31 @@ module ActiveRecord
 
       def build_arel(aliases)
         arel = Arel::SelectManager.new(table)
+        values = @values
 
-        build_joins(arel.join_sources, aliases)
+        build_joins(arel.join_sources, aliases) if values.key?(:joins) || values.key?(:left_outer_joins)
 
-        arel.where(where_clause.ast) unless where_clause.empty?
-        arel.having(having_clause.ast) unless having_clause.empty?
-        arel.take(build_cast_value("LIMIT", limit_value)) if limit_value
-        arel.skip(build_cast_value("OFFSET", offset_value.to_i)) if offset_value
-        arel.group(*arel_columns(group_values)) unless group_values.empty?
+        if (wc = values[:where]) && !wc.empty?
+          arel.where(wc.ast)
+        end
+        if (hc = values[:having]) && !hc.empty?
+          arel.having(hc.ast)
+        end
+        arel.take(build_cast_value("LIMIT", values[:limit])) if values[:limit]
+        arel.skip(build_cast_value("OFFSET", values[:offset].to_i)) if values[:offset]
+        if (grp = values[:group]) && !grp.empty?
+          arel.group(*arel_columns(grp))
+        end
 
-        build_order(arel)
-        build_with(arel)
+        build_order(arel) if values.key?(:order) || values.key?(:default_order)
+        build_with(arel) if values.key?(:with)
         build_select(arel)
 
-        arel.optimizer_hints(*optimizer_hints_values) unless optimizer_hints_values.empty?
-        arel.comment(*annotate_values) unless annotate_values.empty?
-        arel.distinct(distinct_value)
-        arel.from(build_from) unless from_clause.empty?
-        arel.lock(lock_value) if lock_value
+        arel.optimizer_hints(*values[:optimizer_hints]) if values.key?(:optimizer_hints)
+        arel.comment(*values[:annotate]) if values.key?(:annotate)
+        arel.distinct(true) if values[:distinct]
+        arel.from(build_from) if values.key?(:from)
+        arel.lock(values[:lock]) if values[:lock]
 
         arel
       end
@@ -1865,12 +1916,16 @@ module ActiveRecord
       end
 
       def select_named_joins(join_names, stashed_joins = nil, &block)
-        cte_joins, associations = join_names.partition do |join_name|
-          Symbol === join_name && with_values.any? { _1.key?(join_name) }
-        end
+        if with_values.any?
+          cte_joins, associations = join_names.partition do |join_name|
+            Symbol === join_name && with_values.any? { _1.key?(join_name) }
+          end
 
-        cte_joins.each do |cte_name|
-          block&.call(CTEJoin.new(cte_name))
+          cte_joins.each do |cte_name|
+            block&.call(CTEJoin.new(cte_name))
+          end
+        else
+          associations = join_names
         end
 
         select_association_list(associations, stashed_joins, &block)
@@ -1975,7 +2030,7 @@ module ActiveRecord
         elsif model.ignored_columns.any? || model.enumerate_columns_in_select_statements || model.only_columns.any?
           arel.project(*model.column_names.map { |field| table[field] })
         else
-          arel.project(table[Arel.star])
+          arel.project(@star_projection ||= table[Arel.star])
         end
       end
 
@@ -2046,7 +2101,7 @@ module ActiveRecord
       end
 
       def arel_column_with_table(table_name, column_name)
-        self.references_values |= [Arel.sql(table_name, retryable: true)]
+        self.references_values |= [Arel::Nodes::SqlLiteral.new(table_name, retryable: true)]
 
         if column_name.is_a?(Symbol) || !column_name.match?(/\W/)
           predicate_builder.resolve_arel_attribute(table_name, column_name) do
@@ -2061,7 +2116,9 @@ module ActiveRecord
         field = field.name if is_symbol = field.is_a?(Symbol)
 
         field = model.attribute_aliases[field] || field
-        from = from_clause.name || from_clause.value
+        from = if @values.key?(:from)
+          from_clause.name || from_clause.value
+        end
 
         if model.columns_hash.key?(field) && (!from || table_name_matches?(from))
           table[field]
@@ -2072,7 +2129,7 @@ module ActiveRecord
         elsif Arel.arel_node?(field)
           field
         elsif is_symbol
-          Arel.sql(model.adapter_class.quote_table_name(field), retryable: true)
+          Arel::Nodes::SqlLiteral.new(model.adapter_class.quote_table_name(field), retryable: true)
         else
           Arel.sql(field)
         end
@@ -2138,9 +2195,14 @@ module ActiveRecord
       end
 
       def build_order(arel)
-        orders = order_values.compact_blank
-        orders = default_order_values.compact_blank if orders.empty?
-        arel.order(*orders) unless orders.empty?
+        orders = order_values
+        return if orders.empty?
+        orders = orders.compact_blank if orders.any?(&:blank?)
+        if orders.empty?
+          orders = default_order_values.compact_blank
+          return if orders.empty?
+        end
+        arel.order(*orders)
       end
 
       VALID_DIRECTIONS = Set.new([:asc, :desc, :ASC, :DESC,
@@ -2165,21 +2227,44 @@ module ActiveRecord
       end
 
       def preprocess_order_args(order_args)
-        model.disallow_raw_sql!(
-          flattened_args(order_args),
-          permit: model.adapter_class.column_name_with_order_matcher
-        )
+        # Fast path: if all args are Symbols or simple {Symbol => Symbol} hashes,
+        # skip raw SQL validation (symbols are always safe) and column_references
+        # (no table references to extract from simple column names)
+        simple = true
+        order_args.each do |arg|
+          case arg
+          when Symbol
+            # always safe, no references
+          when Hash
+            arg.each do |k, v|
+              unless k.is_a?(Symbol) && v.is_a?(Symbol)
+                simple = false
+                break
+              end
+            end
+          else
+            simple = false
+          end
+          break unless simple
+        end
+
+        unless simple
+          model.disallow_raw_sql!(
+            flattened_args(order_args),
+            permit: model.adapter_class.column_name_with_order_matcher
+          )
+
+          references = column_references(order_args)
+          self.references_values |= references unless references.empty?
+        end
 
         validate_order_args(order_args)
-
-        references = column_references(order_args)
-        self.references_values |= references unless references.empty?
 
         # if a symbol is given we prepend the quoted table name
         order_args.map! do |arg|
           case arg
           when Symbol
-            order_column(arg.to_s).asc
+            order_column(arg.name).asc
           when Hash
             arg.map do |key, value|
               if value.is_a?(Hash)
@@ -2190,6 +2275,8 @@ module ActiveRecord
                 case key
                 when Arel::Nodes::SqlLiteral, Arel::Nodes::Node, Arel::Attribute
                   key.public_send(value.downcase)
+                when Symbol
+                  order_column(key.name).public_send(value.downcase)
                 else
                   order_column(key.to_s).public_send(value.downcase)
                 end
@@ -2229,7 +2316,7 @@ module ActiveRecord
               arg.expr.relation.name
             end
           end
-        end.filter_map { |ref| Arel.sql(ref, retryable: true) if ref }
+        end.filter_map { |ref| Arel::Nodes::SqlLiteral.new(ref, retryable: true) if ref }
       end
 
       def extract_table_name_from(string)
@@ -2241,7 +2328,7 @@ module ActiveRecord
           if attr_name == "count" && !group_values.empty?
             table[attr_name]
           else
-            Arel.sql(model.adapter_class.quote_table_name(attr_name), retryable: true)
+            Arel::Nodes::SqlLiteral.new(model.adapter_class.quote_table_name(attr_name), retryable: true)
           end
         end
       end
@@ -2320,12 +2407,16 @@ module ActiveRecord
       end
 
       def process_select_args(fields)
-        fields.flat_map do |field|
-          if field.is_a?(Hash)
-            arel_column_aliases_from_hash(field)
-          else
-            field
+        if fields.any? { |f| f.is_a?(Hash) }
+          fields.flat_map do |field|
+            if field.is_a?(Hash)
+              arel_column_aliases_from_hash(field)
+            else
+              field
+            end
           end
+        else
+          fields
         end
       end
 

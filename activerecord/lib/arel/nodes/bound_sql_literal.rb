@@ -3,7 +3,7 @@
 module Arel # :nodoc: all
   module Nodes
     class BoundSqlLiteral < NodeExpression
-      attr_reader :sql_with_placeholders, :positional_binds, :named_binds
+      attr_reader :sql_with_placeholders, :positional_binds, :named_binds, :sql_segments
 
       def initialize(sql_with_placeholders, positional_binds, named_binds)
         has_positional = !(positional_binds.nil? || positional_binds.empty?)
@@ -33,9 +33,12 @@ module Arel # :nodoc: all
         if has_positional
           @positional_binds = positional_binds
           @named_binds = nil
+          # Pre-split for the visitor: split on '?' to get text segments
+          @sql_segments = sql_with_placeholders.split("?", -1).freeze
         else
           @positional_binds = nil
           @named_binds = named_binds
+          @sql_segments = nil
         end
       end
 

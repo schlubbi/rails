@@ -82,7 +82,11 @@ module Arel # :nodoc: all
     def [](name, table = self)
       name = name.name if name.is_a?(Symbol)
       name = @klass.attribute_aliases[name] || name if @klass
-      Attribute.new(table, name)
+      if table.equal?(self)
+        (@attribute_cache ||= {})[name] ||= Attribute.new(table, name)
+      else
+        Attribute.new(table, name)
+      end
     end
 
     def hash

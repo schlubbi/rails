@@ -3,6 +3,7 @@
 require "active_record/connection_adapters/sql_type_metadata"
 require "active_record/connection_adapters/abstract/schema_dumper"
 require "active_record/connection_adapters/abstract/schema_creation"
+require "arel/collectors/unprepared_string"
 require "active_support/concurrency/null_lock"
 require "active_support/concurrency/load_interlock_aware_monitor"
 require "active_support/concurrency/thread_monitor"
@@ -1337,10 +1338,7 @@ module ActiveRecord
               Arel::Collectors::Bind.new,
             )
           else
-            Arel::Collectors::SubstituteBinds.new(
-              self,
-              Arel::Collectors::SQLString.new,
-            )
+            Arel::Collectors::UnpreparedString.new(self)
           end
         end
 
