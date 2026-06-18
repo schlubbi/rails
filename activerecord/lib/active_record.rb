@@ -69,6 +69,7 @@ module ActiveRecord
   autoload :QueryCache
   autoload :QueryLogs
   autoload :Querying
+  autoload :FastQuery
   autoload :ReadonlyAttributes
   autoload :RecordInvalid, "active_record/validations"
   autoload :Reflection

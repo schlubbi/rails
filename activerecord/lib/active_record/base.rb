@@ -288,6 +288,7 @@ module ActiveRecord # :nodoc:
     extend ConnectionHandling
     extend QueryCache::ClassMethods
     extend Querying
+    include FastQuery
     extend Translation
     extend DynamicMatchers
     extend DelegatedType
