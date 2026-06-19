@@ -85,6 +85,13 @@ module ActiveRecord
       # to the database while the app is running.
       class_attribute :enumerate_columns_in_select_statements, instance_accessor: false, default: false
 
+      ##
+      # :singleton-method:
+      # Maximum number of query shapes to cache per model class. Each cached
+      # shape avoids rebuilding the Arel AST and running the SQL visitor for
+      # repeated query patterns. Set to 0 to disable query shape caching.
+      class_attribute :query_shape_cache_max_size, instance_accessor: false, default: 2048
+
       class_attribute :belongs_to_required_by_default, instance_accessor: false
 
       class_attribute :strict_loading_by_default, instance_accessor: false, default: false
@@ -264,6 +271,11 @@ module ActiveRecord
     module ClassMethods
       def initialize_find_by_cache # :nodoc:
         @find_by_statement_cache = { true => Concurrent::Map.new, false => Concurrent::Map.new }
+        @query_shape_cache = LruCache.new(query_shape_cache_max_size)
+      end
+
+      def query_shape_cache # :nodoc:
+        @query_shape_cache
       end
 
       def find(*ids) # :nodoc:

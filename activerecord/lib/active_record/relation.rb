@@ -1,5 +1,8 @@
 # frozen_string_literal: true
 
+require "active_record/relation/query_shape_cache"
+require "active_record/relation/cached_query_shape"
+
 module ActiveRecord
   # = Active Record \Relation
   class Relation
@@ -67,6 +70,7 @@ module ActiveRecord
     include Enumerable
     include FinderMethods, Calculations, SpawnMethods, QueryMethods, Batches, Explain, Delegation
     include SignedId::RelationMethods, TokenFor::RelationMethods
+    include QueryShapeCache
 
     attr_reader :table, :model, :loaded, :predicate_builder
     attr_accessor :skip_preloading_value
@@ -1482,7 +1486,20 @@ module ActiveRecord
             end
           else
             model.with_connection do |c|
-              model._query_by_sql(c, arel, async: async)
+              if model.query_shape_cache_max_size > 0 && !c.prepared_statements
+                cached = find_cached_query_shape(c)
+                if cached
+                  sql, retryable = cached
+                  c.select_all(sql, "#{model.name} Load", async: async, allow_retry: retryable)
+                else
+                  arel_node = arel
+                  result = model._query_by_sql(c, arel_node, async: async)
+                  cache_query_shape!(c, arel_node.ast)
+                  result
+                end
+              else
+                model._query_by_sql(c, arel, async: async)
+              end
             end
           end
         end

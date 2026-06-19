@@ -104,6 +104,7 @@ module ActiveRecord
     autoload :DisableJoinsAssociationRelation
     autoload :FutureResult
     autoload :LegacyYamlAdapter
+    autoload :LruCache
     autoload :Promise
     autoload :Relation
     autoload :Result
