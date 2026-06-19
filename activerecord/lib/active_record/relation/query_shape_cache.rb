@@ -5,7 +5,7 @@ module ActiveRecord
     module QueryShapeCache # :nodoc:
       private
 
-        # Check cache and return [sql, retryable] or nil.
+        # Check cache and return [sql, retryable, cached_shape] or nil.
         def find_cached_query_shape(connection)
           return unless cacheable_query_shape?
 
@@ -22,7 +22,7 @@ module ActiveRecord
           end
 
           sql = cached.query_builder.sql_for(binds, connection)
-          [sql, cached.query_builder.retryable]
+          [sql, cached.query_builder.retryable, cached]
         end
 
         # After a cache miss, compile via the shape-aware collector and store.
