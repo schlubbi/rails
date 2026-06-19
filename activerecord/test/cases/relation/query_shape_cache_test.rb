@@ -4,6 +4,8 @@ require "cases/helper"
 require "models/post"
 require "models/comment"
 require "models/author"
+require "models/topic"
+require "models/reply"
 
 module ActiveRecord
   class QueryShapeCacheTest < ActiveRecord::TestCase
@@ -276,6 +278,219 @@ module ActiveRecord
 
       def current_adapter_uses_prepared_statements?
         Post.lease_connection.prepared_statements
+      end
+  end
+
+  class QueryShapeCacheInstantiationPlanTest < ActiveRecord::TestCase
+    fixtures :posts, :comments, :authors, :topics
+
+    setup do
+      @original_max_size = ActiveRecord::Base.query_shape_cache_max_size
+      Post.query_shape_cache.clear
+      Topic.query_shape_cache.clear
+    end
+
+    teardown do
+      ActiveRecord::Base.query_shape_cache_max_size = @original_max_size
+      if defined?(@original_prepared)
+        Post.lease_connection.instance_variable_set(:@prepared_statements, @original_prepared)
+      end
+      Post.query_shape_cache.clear
+      Topic.query_shape_cache.clear
+    end
+
+    # --- Instantiation plan caching ---
+
+    test "instantiation plan is cached on second cache hit" do
+      skip_if_prepared_statements!
+
+      # First query: cache miss (builds SQL cache entry)
+      Post.where(author_id: authors(:david).id).to_a
+
+      # Second query: cache hit (builds + stores instantiation plan)
+      Post.where(author_id: authors(:mary).id).to_a
+
+      # Verify plan is cached
+      cached = get_first_cached_shape(Post)
+      assert_not_nil cached.instantiation_plan
+      assert_equal Post, cached.instantiation_plan.model_class
+    end
+
+    test "instantiation plan produces correct records" do
+      skip_if_prepared_statements!
+
+      # Warm the cache
+      Post.where(author_id: authors(:david).id).to_a
+
+      # This hit uses the plan
+      result = Post.where(author_id: authors(:mary).id).to_a
+
+      assert result.all? { |r| r.is_a?(Post) }
+      assert result.all? { |r| r.author_id == authors(:mary).id }
+      assert result.none?(&:new_record?)
+    end
+
+    test "instantiation plan returns correct attribute values" do
+      skip_if_prepared_statements!
+
+      post = posts(:welcome)
+
+      # Warm
+      Post.where(id: post.id + 1000).to_a
+
+      # Hit with plan
+      result = Post.where(id: post.id).to_a
+      assert_equal 1, result.size
+      assert_equal post.id, result.first.id
+      assert_equal post.title, result.first.title
+      assert_equal post.author_id, result.first.author_id
+    end
+
+    # --- STI with instantiation plan ---
+
+    test "instantiation plan handles STI correctly" do
+      skip_if_prepared_statements!
+
+      Topic.query_shape_cache.clear
+
+      # Create topics with different types
+      topic = Topic.create!(title: "Plain Topic")
+      reply = Reply.create!(title: "A Reply", parent_id: topic.id, content: "reply content")
+
+      # Warm cache
+      Topic.where(title: "Plain Topic").to_a
+
+      # Hit with STI — should instantiate correct subclass
+      result = Topic.where(title: "A Reply").to_a
+      assert_equal 1, result.size
+      assert_equal Reply, result.first.class
+      assert_equal "A Reply", result.first.title
+    ensure
+      reply&.destroy
+      topic&.destroy
+    end
+
+    # --- Callbacks with instantiation plan ---
+
+    test "after_find and after_initialize callbacks still fire with plan" do
+      skip_if_prepared_statements!
+
+      Topic.query_shape_cache.clear
+
+      # Topic has after_initialize callbacks
+      Topic.where(id: topics(:first).id + 10000).to_a # Warm with no results won't cache plan
+
+      # Actually warm properly
+      Topic.where(id: topics(:first).id).to_a
+
+      # Second hit uses plan — callbacks must still fire
+      Topic.after_initialize_called = false
+      result = Topic.where(id: topics(:first).id).to_a
+      assert_equal true, Topic.after_initialize_called,
+        "after_initialize should still be called when using instantiation plan"
+    end
+
+    test "skip_callbacks is true for models without after_find/after_initialize" do
+      skip_if_prepared_statements!
+
+      # Post has no after_find/after_initialize by default
+      Post.where(id: 1).to_a
+      Post.where(id: 2).to_a
+
+      cached = get_first_cached_shape(Post)
+      assert cached.instantiation_plan.skip_callbacks,
+        "Plan should mark callbacks as skippable for Post"
+    end
+
+    test "skip_callbacks is false for models with after_find/after_initialize" do
+      skip_if_prepared_statements!
+
+      Topic.query_shape_cache.clear
+      Topic.where(id: topics(:first).id).to_a
+      Topic.where(id: topics(:second).id).to_a
+
+      cached = get_first_cached_shape(Topic)
+      assert_not cached.instantiation_plan.skip_callbacks,
+        "Plan should NOT mark callbacks as skippable for Topic"
+    end
+
+    # --- readonly / strict_loading still applied ---
+
+    test "readonly is applied to records from instantiation plan" do
+      skip_if_prepared_statements!
+
+      Post.where(id: 1).to_a # warm
+      result = Post.readonly.where(id: posts(:welcome).id).to_a
+
+      assert result.first.readonly?
+    end
+
+    test "strict_loading is applied to records from instantiation plan" do
+      skip_if_prepared_statements!
+
+      Post.where(id: 1).to_a # warm
+      result = Post.strict_loading.where(id: posts(:welcome).id).to_a
+
+      assert result.first.strict_loading?
+    end
+
+    # --- select() with instantiation plan ---
+
+    test "select with subset of columns works with plan" do
+      skip_if_prepared_statements!
+
+      Post.select(:id, :title).where(author_id: 1).to_a # warm
+      result = Post.select(:id, :title).where(author_id: authors(:david).id).to_a
+
+      assert result.first.has_attribute?(:id)
+      assert result.first.has_attribute?(:title)
+      assert_equal posts(:welcome).title, result.first.title if result.any?
+    end
+
+    # --- Thread safety ---
+
+    test "instantiation plan is frozen and thread-safe" do
+      skip_if_prepared_statements!
+
+      Post.where(id: 1).to_a
+      Post.where(id: 2).to_a
+
+      cached = get_first_cached_shape(Post)
+      plan = cached.instantiation_plan
+
+      assert plan.frozen?
+      assert plan.additional_types.frozen?
+    end
+
+    # --- Block passed to instantiate ---
+
+    test "block is yielded to each record with plan" do
+      skip_if_prepared_statements!
+
+      Post.where(author_id: 1).to_a # warm
+
+      yielded = []
+      Post.where(author_id: authors(:david).id).each { |r| yielded << r.id }
+
+      assert yielded.any?
+      assert yielded.all? { |id| id.is_a?(Integer) }
+    end
+
+    private
+      def skip_if_prepared_statements!
+        if Post.lease_connection.prepared_statements
+          connection = Post.lease_connection
+          @original_prepared = connection.instance_variable_get(:@prepared_statements)
+          connection.instance_variable_set(:@prepared_statements, false)
+        end
+      end
+
+      def get_first_cached_shape(klass)
+        # Access the internal LRU cache map to find the stored shape
+        cache = klass.query_shape_cache
+        map = cache.instance_variable_get(:@map)
+        _, shape = map.each_pair.first
+        shape
       end
   end
 end

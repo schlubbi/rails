@@ -1490,7 +1490,8 @@ module ActiveRecord
               if model.query_shape_cache_max_size > 0 && !c.prepared_statements
                 cached = find_cached_query_shape(c)
                 if cached
-                  sql, retryable = cached
+                  sql, retryable, shape = cached
+                  @_cached_shape = shape
                   c.select_all(sql, "#{model.name} Load", async: async, allow_retry: retryable)
                 else
                   arel_node = arel
@@ -1512,9 +1513,23 @@ module ActiveRecord
           records = @_join_dependency.instantiate(rows, strict_loading_value, &block).freeze
           @_join_dependency = nil
           records
+        elsif (shape = @_cached_shape)
+          @_cached_shape = nil
+          plan = shape.instantiation_plan || build_and_cache_instantiation_plan(shape, rows)
+          plan.instantiate_records(rows, &block)
         else
           model._load_from_sql(rows, &block).freeze
         end
+      end
+
+      def build_and_cache_instantiation_plan(shape, result_set)
+        plan = CachedInstantiationPlan.new(model, result_set.column_types)
+        updated = shape.with_instantiation_plan(plan)
+        # Re-store under the same key. Thread-safe: worst case two threads
+        # both compute and store — result is identical.
+        key = query_shape_key
+        model.query_shape_cache.set(key, updated) if key
+        plan
       end
 
       def skip_query_cache_if_necessary(&block)
