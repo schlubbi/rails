@@ -29,6 +29,7 @@ module ActiveRecord
   #   cache.execute(["my book"], ClothingItem.lease_connection)
   class StatementCache # :nodoc:
     class Substitute; end # :nodoc:
+    class ArraySubstitute; end # :nodoc:
 
     class Query # :nodoc:
       attr_reader :retryable
@@ -46,20 +47,31 @@ module ActiveRecord
     class PartialQuery < Query # :nodoc:
       def initialize(values, retryable:)
         @values = values
-        @indexes = values.each_with_index.find_all { |thing, i|
-          Substitute === thing
-        }.map(&:last)
+        @indexes = []
+        values.each_with_index do |thing, i|
+          if Substitute === thing || ArraySubstitute === thing
+            @indexes << i
+          end
+        end
         @retryable = retryable
       end
 
       def sql_for(binds, connection)
         val = @values.dup
         @indexes.each do |i|
-          value = binds.shift
-          if ActiveModel::Attribute === value
-            value = value.value_for_database
+          if ArraySubstitute === @values[i]
+            array = binds.shift
+            val[i] = array.map { |v|
+              v = v.value_for_database if ActiveModel::Attribute === v
+              connection.quote(v)
+            }.join(", ")
+          else
+            value = binds.shift
+            if ActiveModel::Attribute === value
+              value = value.value_for_database
+            end
+            val[i] = connection.quote(value)
           end
-          val[i] = connection.quote(value)
         end
         val.join
       end

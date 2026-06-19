@@ -113,9 +113,9 @@ module ActiveRecord
         attrs
       end
 
-      protected
-        attr_reader :predicates
+      attr_reader :predicates
 
+      protected
         def referenced_columns
           hash = {}
           each_attributes { |attr, node| hash[attr] = node }
