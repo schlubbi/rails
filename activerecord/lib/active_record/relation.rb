@@ -100,6 +100,7 @@ module ActiveRecord
 
     def initialize_copy(other)
       @values = @values.dup
+      @raw_where_hashes = @raw_where_hashes.dup if @raw_where_hashes.is_a?(Array)
       reset
     end
 
