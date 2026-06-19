@@ -15,7 +15,12 @@ module ActiveRecord
           cached = model.query_shape_cache.get(key)
           return unless cached
 
-          binds = extract_shape_binds(cached.bind_map)
+          binds = if @raw_where_hashes.is_a?(Array)
+            extract_binds_from_raw_hashes(cached.bind_map)
+          else
+            extract_shape_binds(cached.bind_map)
+          end
+
           sql = cached.query_builder.sql_for(binds, connection)
           [sql, cached.query_builder.retryable]
         end
@@ -60,18 +65,14 @@ module ActiveRecord
         # Returns nil if any component is uncacheable.
         def query_shape_key
           parts = []
-
-          # Model identity
           parts << model.object_id
 
-          # Where clause shape
           where_clause.predicates.each do |pred|
             shape = predicate_shape(pred)
             return nil unless shape
             parts << shape
           end
 
-          # Order shape
           if order_values.any?
             order_values.each do |o|
               shape = order_shape(o)
@@ -80,24 +81,17 @@ module ActiveRecord
             end
           end
 
-          # Limit/offset presence
           parts << :limit if limit_value
           parts << :offset if offset_value
-
-          # Distinct
           parts << :distinct if distinct_value
-
-          # Lock
           parts << [:lock, lock_value] if lock_value
 
-          # Select columns
           if select_values.any?
             select_shapes = select_values.map { |s| select_shape(s) }
             return nil if select_shapes.any?(&:nil?)
             parts << [:select, select_shapes]
           end
 
-          # Group by
           if group_values.any?
             group_shapes = group_values.map { |g| group_shape(g) }
             return nil if group_shapes.any?(&:nil?)
@@ -106,6 +100,8 @@ module ActiveRecord
 
           parts.hash
         end
+
+        # --- Predicate shape helpers ---
 
         def predicate_shape(pred)
           case pred
@@ -201,69 +197,58 @@ module ActiveRecord
           end
         end
 
-        # Build a bind_map from the binds collected during compilation.
-        # Each entry describes how to extract the bind value on cache hit.
-        #
-        # The bind_map is an array of descriptors:
-        #   { source: :predicate, index: N, extractor: :scalar }
-        #   { source: :predicate, index: N, extractor: :array }
-        #   { source: :limit }
-        #   { source: :offset }
-        def build_bind_map_from_binds(binds)
-          bind_map = []
-          pred_bind_index = 0  # which predicate we're matching
-          preds = where_clause.predicates
-          pred_remaining_scalars = 0  # for Between (2 scalars from one predicate)
+        # --- Phase 2: Fast bind extraction from raw where hashes ---
 
-          binds.each do |bind|
-            if bind.respond_to?(:name) && bind.name == "LIMIT"
-              bind_map << { source: :limit }
-              next
-            end
+        # Extract binds from the tracked raw where hashes instead of
+        # walking Arel predicate nodes. Faster because it avoids
+        # QueryAttribute and Arel node traversal.
+        def extract_binds_from_raw_hashes(bind_map)
+          binds = []
+          attr_types = model.attribute_types
 
-            if bind.respond_to?(:name) && bind.name == "OFFSET"
-              bind_map << { source: :offset }
-              next
-            end
-
-            # It's a predicate bind. If it's an Array, it's from HomogeneousIn
-            # via ShapeAwareCollector#add_binds which collapses all values into one entry.
-            if bind.is_a?(Array)
-              bind_map << { source: :predicate, index: pred_bind_index, extractor: :array }
-              pred_bind_index += 1
-              next
-            end
-
-            # Scalar predicate bind
-            if pred_remaining_scalars > 0
-              # Continuation of a multi-bind predicate (Between)
-              pred_remaining_scalars -= 1
-              bind_map << { source: :predicate, index: pred_bind_index, extractor: :between_right }
-              if pred_remaining_scalars == 0
-                pred_bind_index += 1
-              end
-              next
-            end
-
-            pred = preds[pred_bind_index]
-            return nil unless pred  # more binds than predicates — uncacheable
-
-            case pred
-            when Arel::Nodes::Between
-              # Between emits 2 scalar binds — mark first as :between_left, second as :between_right
-              bind_map << { source: :predicate, index: pred_bind_index, extractor: :between_left }
-              pred_remaining_scalars = 1  # one more to come
-            else
-              bind_map << { source: :predicate, index: pred_bind_index, extractor: :scalar }
-              pred_bind_index += 1
-            end
+          # Build a flat list of (column, value) from raw hashes
+          # in the same order predicates were built
+          raw_pairs = []
+          @raw_where_hashes.each do |hash|
+            hash.each { |col, val| raw_pairs << [col, val] }
           end
 
-          bind_map
+          bind_map.each do |desc|
+            case desc[:source]
+            when :predicate
+              col, val = raw_pairs[desc[:index]]
+              type = attr_types[col]
+
+              case desc[:extractor]
+              when :array
+                binds << val.map { |v| cast_bind_value(type, v) }
+              when :between_left
+                binds << cast_bind_value(type, val.begin)
+              when :between_right
+                binds << cast_bind_value(type, val.end)
+              when :scalar
+                binds << cast_bind_value(type, val)
+              end
+            when :limit
+              binds << limit_value
+            when :offset
+              binds << offset_value.to_i
+            end
+          end
+          binds
         end
 
-        # Extract bind values from the current relation's state,
-        # in the order the cached SQL template expects.
+        # Type-cast a raw Ruby value into a database-ready form.
+        def cast_bind_value(type, value)
+          if type
+            type.serialize(type.cast(value))
+          else
+            value
+          end
+        end
+
+        # --- Phase 1: Bind extraction from Arel predicates ---
+
         def extract_shape_binds(bind_map)
           binds = []
           preds = where_clause.predicates
@@ -286,7 +271,6 @@ module ActiveRecord
           binds
         end
 
-        # Extract a single scalar bind value from a predicate node.
         def extract_scalar_bind(pred, desc)
           case pred
           when Arel::Nodes::Equality, Arel::Nodes::NotEqual,
@@ -305,6 +289,56 @@ module ActiveRecord
           when Arel::Nodes::Grouping
             extract_scalar_bind(pred.expr, desc)
           end
+        end
+
+        # --- Bind map building ---
+
+        def build_bind_map_from_binds(binds)
+          bind_map = []
+          pred_bind_index = 0
+          preds = where_clause.predicates
+          pred_remaining_scalars = 0
+
+          binds.each do |bind|
+            if bind.respond_to?(:name) && bind.name == "LIMIT"
+              bind_map << { source: :limit }
+              next
+            end
+
+            if bind.respond_to?(:name) && bind.name == "OFFSET"
+              bind_map << { source: :offset }
+              next
+            end
+
+            if bind.is_a?(Array)
+              bind_map << { source: :predicate, index: pred_bind_index, extractor: :array }
+              pred_bind_index += 1
+              next
+            end
+
+            if pred_remaining_scalars > 0
+              pred_remaining_scalars -= 1
+              bind_map << { source: :predicate, index: pred_bind_index, extractor: :between_right }
+              if pred_remaining_scalars == 0
+                pred_bind_index += 1
+              end
+              next
+            end
+
+            pred = preds[pred_bind_index]
+            return nil unless pred
+
+            case pred
+            when Arel::Nodes::Between
+              bind_map << { source: :predicate, index: pred_bind_index, extractor: :between_left }
+              pred_remaining_scalars = 1
+            else
+              bind_map << { source: :predicate, index: pred_bind_index, extractor: :scalar }
+              pred_bind_index += 1
+            end
+          end
+
+          bind_map
         end
 
       # Collector that collapses add_binds (HomogeneousIn) into a single

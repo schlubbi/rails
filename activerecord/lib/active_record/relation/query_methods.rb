@@ -1106,6 +1106,17 @@ module ActiveRecord
 
     def where!(opts, *rest) # :nodoc:
       self.where_clause += build_where_clause(opts, rest)
+      # Track raw hash inputs for Phase 2 fast bind extraction on cache hit
+      if Hash === opts && rest.empty?
+        if @raw_where_hashes != false
+          (@raw_where_hashes ||= []) << opts.transform_keys { |k|
+            k = k.to_s
+            model.attribute_aliases[k] || k
+          }
+        end
+      else
+        @raw_where_hashes = false  # non-hash where — can't use fast path
+      end
       self
     end
 
