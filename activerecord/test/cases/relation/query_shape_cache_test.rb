@@ -680,4 +680,98 @@ module ActiveRecord
         end
       end
   end
+
+  class QueryShapeCacheBindExtractionTest < ActiveRecord::TestCase
+    fixtures :posts, :authors
+
+    setup do
+      @original_max_size = ActiveRecord::Base.query_shape_cache_max_size
+      Post.query_shape_cache.clear
+    end
+
+    teardown do
+      ActiveRecord::Base.query_shape_cache_max_size = @original_max_size
+      if defined?(@original_prepared)
+        Post.lease_connection.instance_variable_set(:@prepared_statements, @original_prepared)
+      end
+      Post.query_shape_cache.clear
+    end
+
+    # --- Bug A: Arel::Nodes::Casted inline literals must not be cached ---
+
+    test "raw Arel comparison with Casted literal is not cached" do
+      skip_if_prepared_statements!
+
+      Post.query_shape_cache.clear
+
+      # arel_table[:col].lteq(n) produces an inline Casted node, not a bind
+      Post.where(Post.arel_table[:id].lteq(1)).to_a
+      assert_equal 0, Post.query_shape_cache.size,
+        "Casted literal predicates must not be cached"
+    end
+
+    test "raw Arel comparison returns correct results for different values" do
+      skip_if_prepared_statements!
+
+      p1 = posts(:welcome)
+      p2 = posts(:thinking)
+      low_id = [p1.id, p2.id].min
+      high_id = [p1.id, p2.id].max
+
+      r1 = Post.where(Post.arel_table[:id].lteq(low_id)).to_a
+      r2 = Post.where(Post.arel_table[:id].lteq(high_id)).to_a
+
+      assert r2.size >= r1.size,
+        "Higher threshold should return at least as many rows"
+    end
+
+    # --- Bug B: Nested array IN list ---
+
+    test "nested array where clause returns correct results on cache hit" do
+      skip_if_prepared_statements!
+
+      Post.query_shape_cache.clear
+      ids = [posts(:welcome).id, posts(:thinking).id]
+
+      # Nested array: [[id1, id2]] — Rails flattens to IN (id1, id2)
+      result1 = Post.where(id: [ids]).to_a
+      assert_equal ids.sort, result1.map(&:id).sort
+
+      # Cache hit with different nested array
+      other_ids = [posts(:welcome).id]
+      result2 = Post.where(id: [other_ids]).to_a
+      assert_equal other_ids, result2.map(&:id),
+        "Nested array IN should use predicate values, not re-cast raw array"
+    end
+
+    # --- Bug C: Association FK as AR object ---
+
+    test "where with AR record as FK value returns correct results on cache hit" do
+      skip_if_prepared_statements!
+
+      Post.query_shape_cache.clear
+
+      david = authors(:david)
+      mary = authors(:mary)
+
+      # where(author_id: <Author record>) — raw value is the AR object
+      result1 = Post.where(author_id: david).to_a
+      assert result1.all? { |r| r.author_id == david.id }
+
+      # Cache hit — must read bind from predicate, not re-cast the AR object
+      result2 = Post.where(author_id: mary).to_a
+      assert result2.all? { |r| r.author_id == mary.id },
+        "FK equality with AR object should resolve to correct id on cache hit"
+      assert_not_equal result1.map(&:id).sort, result2.map(&:id).sort
+    end
+
+    private
+      def skip_if_prepared_statements!
+        if Post.lease_connection.prepared_statements
+          connection = Post.lease_connection
+          @original_prepared = connection.instance_variable_get(:@prepared_statements)
+          connection.instance_variable_set(:@prepared_statements, false)
+        end
+      end
+  end
 end
