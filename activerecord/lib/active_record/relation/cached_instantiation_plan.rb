@@ -94,17 +94,7 @@ module ActiveRecord
             attributes = ActiveModel::LazyAttributeSet.new(values, model_types, additional, defaults)
 
             record = klass.allocate
-            record.instance_variable_set(:@new_record, false)
-            record.instance_variable_set(:@attributes, attributes)
-            record.instance_variable_set(:@readonly, false)
-            record.instance_variable_set(:@previously_new_record, false)
-            record.instance_variable_set(:@destroyed, false)
-            record.instance_variable_set(:@marked_for_destruction, false)
-            record.instance_variable_set(:@destroyed_by_association, nil)
-            record.instance_variable_set(:@_start_transaction_state, nil)
-            record.instance_variable_set(:@primary_key, pk)
-            record.instance_variable_set(:@strict_loading, strict_loading_default)
-            record.instance_variable_set(:@strict_loading_mode, strict_loading_mode)
+            init_record_ivars(record, attributes, pk, strict_loading_default, strict_loading_mode)
 
             if block
               yield record
@@ -160,17 +150,7 @@ module ActiveRecord
             )
 
             record = klass.allocate
-            record.instance_variable_set(:@new_record, false)
-            record.instance_variable_set(:@attributes, attributes)
-            record.instance_variable_set(:@readonly, false)
-            record.instance_variable_set(:@previously_new_record, false)
-            record.instance_variable_set(:@destroyed, false)
-            record.instance_variable_set(:@marked_for_destruction, false)
-            record.instance_variable_set(:@destroyed_by_association, nil)
-            record.instance_variable_set(:@_start_transaction_state, nil)
-            record.instance_variable_set(:@primary_key, meta[:pk])
-            record.instance_variable_set(:@strict_loading, meta[:strict_loading])
-            record.instance_variable_set(:@strict_loading_mode, meta[:strict_loading_mode])
+            init_record_ivars(record, attributes, meta[:pk], meta[:strict_loading], meta[:strict_loading_mode])
 
             if block
               yield record
@@ -188,6 +168,54 @@ module ActiveRecord
 
             record
           end.freeze
+        end
+
+        # Set all instance variables that the init_internals chain sets.
+        # Covers: Core, Associations, Aggregations, Transactions, Persistence,
+        # Timestamp, AutosaveAssociation, TouchLater, Dirty.
+        def init_record_ivars(record, attributes, pk, strict_loading, strict_loading_mode) # :nodoc:
+          # Core (core.rb)
+          record.instance_variable_set(:@new_record, false)
+          record.instance_variable_set(:@attributes, attributes)
+          record.instance_variable_set(:@readonly, false)
+          record.instance_variable_set(:@previously_new_record, false)
+          record.instance_variable_set(:@destroyed, false)
+          record.instance_variable_set(:@marked_for_destruction, false)
+          record.instance_variable_set(:@destroyed_by_association, nil)
+          record.instance_variable_set(:@_start_transaction_state, nil)
+          record.instance_variable_set(:@primary_key, pk)
+          record.instance_variable_set(:@strict_loading, strict_loading)
+          record.instance_variable_set(:@strict_loading_mode, strict_loading_mode)
+
+          # Associations (associations.rb)
+          record.instance_variable_set(:@association_cache, {})
+
+          # Aggregations (aggregations.rb)
+          record.instance_variable_set(:@aggregation_cache, {})
+
+          # Transactions (transactions.rb)
+          record.instance_variable_set(:@_last_transaction_return_status, nil)
+          record.instance_variable_set(:@_committed_already_called, nil)
+          record.instance_variable_set(:@_new_record_before_last_commit, nil)
+
+          # Persistence (persistence.rb)
+          record.instance_variable_set(:@_trigger_destroy_callback, nil)
+          record.instance_variable_set(:@_trigger_update_callback, nil)
+
+          # Timestamp (timestamp.rb)
+          record.instance_variable_set(:@_touch_record, nil)
+
+          # AutosaveAssociation (autosave_association.rb)
+          record.instance_variable_set(:@_already_called, nil)
+
+          # TouchLater (touch_later.rb)
+          record.instance_variable_set(:@_defer_touch_attrs, nil)
+
+          # Dirty (attribute_methods/dirty.rb)
+          record.instance_variable_set(:@mutations_before_last_save, nil)
+          record.instance_variable_set(:@mutations_from_database, nil)
+          record.instance_variable_set(:@_touch_attr_names, nil)
+          record.instance_variable_set(:@_skip_dirty_tracking, nil)
         end
     end
   end
