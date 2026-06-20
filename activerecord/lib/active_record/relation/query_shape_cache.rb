@@ -111,7 +111,7 @@ module ActiveRecord
                 [:eq_null, pred.left.name]
               elsif unboundable_value?(pred.right)
                 [:eq_unbound, pred.left.name]
-              else
+              elsif bindable_value?(pred.right)
                 [:eq, pred.left.name]
               end
             end
@@ -119,32 +119,54 @@ module ActiveRecord
             if pred.left.respond_to?(:name)
               if pred.right.nil?
                 [:neq_null, pred.left.name]
-              else
+              elsif bindable_value?(pred.right)
                 [:neq, pred.left.name]
               end
             end
           when Arel::Nodes::HomogeneousIn
             [:in, pred.attribute.name, pred.type]
           when Arel::Nodes::Between
-            [:between, pred.left.name] if pred.left.respond_to?(:name)
+            if pred.left.respond_to?(:name) && between_bounds_bindable?(pred.right)
+              [:between, pred.left.name]
+            end
           when Arel::Nodes::GreaterThan
-            [:gt, pred.left.name] if pred.left.respond_to?(:name)
+            [:gt, pred.left.name] if comparison_cacheable?(pred)
           when Arel::Nodes::GreaterThanOrEqual
-            [:gteq, pred.left.name] if pred.left.respond_to?(:name)
+            [:gteq, pred.left.name] if comparison_cacheable?(pred)
           when Arel::Nodes::LessThan
-            [:lt, pred.left.name] if pred.left.respond_to?(:name)
+            [:lt, pred.left.name] if comparison_cacheable?(pred)
           when Arel::Nodes::LessThanOrEqual
-            [:lteq, pred.left.name] if pred.left.respond_to?(:name)
+            [:lteq, pred.left.name] if comparison_cacheable?(pred)
           when Arel::Nodes::IsNotDistinctFrom
-            [:indist, pred.left.name] if pred.left.respond_to?(:name)
+            [:indist, pred.left.name] if comparison_cacheable?(pred)
           when Arel::Nodes::IsDistinctFrom
-            [:dist, pred.left.name] if pred.left.respond_to?(:name)
+            [:dist, pred.left.name] if comparison_cacheable?(pred)
           when Arel::Nodes::Grouping
             inner = predicate_shape(pred.expr)
             inner ? [:group, inner] : nil
           else
             nil
           end
+        end
+
+        # A comparison predicate is cacheable only when its right-hand value
+        # renders as a SQL bind placeholder (BindParam or Attribute), not an
+        # inline literal (e.g. Arel::Nodes::Casted from raw Arel comparisons).
+        def comparison_cacheable?(pred)
+          pred.left.respond_to?(:name) &&
+            (unboundable_value?(pred.right) || bindable_value?(pred.right))
+        end
+
+        def between_bounds_bindable?(and_node)
+          and_node.is_a?(Arel::Nodes::And) &&
+            bindable_value?(and_node.left) && bindable_value?(and_node.right)
+        end
+
+        # True if a predicate's value node renders as a SQL bind placeholder
+        # rather than being inlined into compiled SQL. Inline literals such as
+        # Arel::Nodes::Casted are NOT bindable.
+        def bindable_value?(node)
+          node.is_a?(Arel::Nodes::BindParam) || node.is_a?(ActiveModel::Attribute)
         end
 
         def or_predicate?(pred)
@@ -239,10 +261,13 @@ module ActiveRecord
 
               case desc[:extractor]
               when :array
-                # Raw value must be Array or Set; convert Set to Array.
-                raw = val.is_a?(Set) ? val.to_a : val
-                return extract_shape_binds(bind_map) unless raw.is_a?(Array)
-                binds << raw.map { |v| cast_bind_value(type, v) }
+                return extract_shape_binds(bind_map) unless val.is_a?(Array) || val.is_a?(Set)
+                # Rails flattens nested arrays, drops nils, dedups before
+                # building HomogeneousIn. Read the already-normalized values
+                # off the predicate (source of truth) instead of re-casting.
+                pred = preds[desc[:index]]
+                return extract_shape_binds(bind_map) unless pred.respond_to?(:casted_values)
+                binds << pred.casted_values
               when :between_left
                 return extract_shape_binds(bind_map) unless val.is_a?(Range)
                 binds << cast_bind_value(type, val.begin)
@@ -251,19 +276,15 @@ module ActiveRecord
                 binds << cast_bind_value(type, val.end)
               when :scalar
                 # Rails collapses single-element arrays/Sets to scalar =.
-                # Unwrap if needed; reject Range (would be BETWEEN).
+                # Validate shape, but read the bind from the predicate (not
+                # the raw value) to handle association FK objects, etc.
                 if val.is_a?(Array) || val.is_a?(Set)
                   arr = val.is_a?(Set) ? val.to_a : val
-                  if arr.size == 1
-                    binds << cast_bind_value(type, arr.first)
-                  else
-                    return extract_shape_binds(bind_map)
-                  end
+                  return extract_shape_binds(bind_map) unless arr.size == 1
                 elsif val.is_a?(Range)
                   return extract_shape_binds(bind_map)
-                else
-                  binds << cast_bind_value(type, val)
                 end
+                binds << extract_scalar_bind(preds[desc[:index]], desc)
               when :none
                 # Predicate emits no bind (IS NULL, unboundable) — skip.
                 next
@@ -393,6 +414,11 @@ module ActiveRecord
 
         # Returns an array of bind map entries for a single predicate,
         # or nil if the predicate is uncacheable.
+        #
+        # Only predicates with bindable values (BindParam / Attribute) emit
+        # bind entries. Inline literals (Arel::Nodes::Casted) bake a varying
+        # value into compiled SQL and cannot be replayed for a different value,
+        # so we refuse to cache them (return nil).
         def predicate_bind_entries(pred, pred_index)
           case pred
           when Arel::Nodes::Equality, Arel::Nodes::NotEqual,
@@ -400,13 +426,24 @@ module ActiveRecord
             if pred.right.nil? || unboundable_value?(pred.right)
               # IS NULL / IS NOT NULL / unboundable — emits zero binds
               [{ source: :predicate, index: pred_index, extractor: :none }]
-            else
+            elsif bindable_value?(pred.right)
               [{ source: :predicate, index: pred_index, extractor: :scalar }]
+            else
+              nil # inline literal (Casted) — not cacheable
             end
           when Arel::Nodes::GreaterThan, Arel::Nodes::GreaterThanOrEqual,
                Arel::Nodes::LessThan, Arel::Nodes::LessThanOrEqual
-            [{ source: :predicate, index: pred_index, extractor: :scalar }]
+            if unboundable_value?(pred.right)
+              []
+            elsif bindable_value?(pred.right)
+              [{ source: :predicate, index: pred_index, extractor: :scalar }]
+            else
+              nil # inline literal — not cacheable
+            end
           when Arel::Nodes::Between
+            and_node = pred.right
+            return nil unless and_node.is_a?(Arel::Nodes::And)
+            return nil unless bindable_value?(and_node.left) && bindable_value?(and_node.right)
             [
               { source: :predicate, index: pred_index, extractor: :between_left },
               { source: :predicate, index: pred_index, extractor: :between_right }
