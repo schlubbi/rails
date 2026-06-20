@@ -202,6 +202,10 @@ module ActiveRecord
         # Extract binds from the tracked raw where hashes instead of
         # walking Arel predicate nodes. Faster because it avoids
         # QueryAttribute and Arel node traversal.
+        #
+        # Falls back to the Arel-based extract_shape_binds when raw values
+        # don't match the expected predicate shape (single-element arrays
+        # collapsed to scalars, implicit STI predicates, etc.).
         def extract_binds_from_raw_hashes(bind_map)
           binds = []
           attr_types = model.attribute_types
@@ -213,21 +217,56 @@ module ActiveRecord
             hash.each { |col, val| raw_pairs << [col, val] }
           end
 
+          # If the number of raw pairs doesn't match the predicate count,
+          # there are implicit predicates (STI type, default scopes) that
+          # aren't in any where-hash. Fall back to the Arel path.
+          preds = where_clause.predicates
+          if raw_pairs.size != preds.size
+            return extract_shape_binds(bind_map)
+          end
+
           bind_map.each do |desc|
             case desc[:source]
             when :predicate
               col, val = raw_pairs[desc[:index]]
+              # Verify column matches the predicate; fall back if not.
+              pred_col = predicate_column_name(preds[desc[:index]])
+              if pred_col && col.to_s != pred_col
+                return extract_shape_binds(bind_map)
+              end
+
               type = attr_types[col]
 
               case desc[:extractor]
               when :array
-                binds << val.map { |v| cast_bind_value(type, v) }
+                # Raw value must be Array or Set; convert Set to Array.
+                raw = val.is_a?(Set) ? val.to_a : val
+                return extract_shape_binds(bind_map) unless raw.is_a?(Array)
+                binds << raw.map { |v| cast_bind_value(type, v) }
               when :between_left
+                return extract_shape_binds(bind_map) unless val.is_a?(Range)
                 binds << cast_bind_value(type, val.begin)
               when :between_right
+                return extract_shape_binds(bind_map) unless val.is_a?(Range)
                 binds << cast_bind_value(type, val.end)
               when :scalar
-                binds << cast_bind_value(type, val)
+                # Rails collapses single-element arrays/Sets to scalar =.
+                # Unwrap if needed; reject Range (would be BETWEEN).
+                if val.is_a?(Array) || val.is_a?(Set)
+                  arr = val.is_a?(Set) ? val.to_a : val
+                  if arr.size == 1
+                    binds << cast_bind_value(type, arr.first)
+                  else
+                    return extract_shape_binds(bind_map)
+                  end
+                elsif val.is_a?(Range)
+                  return extract_shape_binds(bind_map)
+                else
+                  binds << cast_bind_value(type, val)
+                end
+              when :none
+                # Predicate emits no bind (IS NULL, unboundable) — skip.
+                next
               end
             when :limit
               binds << limit_value
@@ -247,6 +286,24 @@ module ActiveRecord
           end
         end
 
+        # Extract the column name from a predicate node.
+        def predicate_column_name(pred)
+          case pred
+          when Arel::Nodes::Equality, Arel::Nodes::NotEqual,
+               Arel::Nodes::GreaterThan, Arel::Nodes::GreaterThanOrEqual,
+               Arel::Nodes::LessThan, Arel::Nodes::LessThanOrEqual,
+               Arel::Nodes::IsNotDistinctFrom, Arel::Nodes::IsDistinctFrom,
+               Arel::Nodes::Between
+            pred.left.respond_to?(:name) ? pred.left.name.to_s : nil
+          when Arel::Nodes::HomogeneousIn
+            pred.attribute.respond_to?(:name) ? pred.attribute.name.to_s : nil
+          when Arel::Nodes::Grouping
+            predicate_column_name(pred.expr)
+          else
+            nil
+          end
+        end
+
         # --- Phase 1: Bind extraction from Arel predicates ---
 
         def extract_shape_binds(bind_map)
@@ -256,6 +313,7 @@ module ActiveRecord
           bind_map.each do |desc|
             case desc[:source]
             when :predicate
+              next if desc[:extractor] == :none
               pred = preds[desc[:index]]
               if desc[:extractor] == :array
                 binds << pred.casted_values
@@ -292,53 +350,74 @@ module ActiveRecord
         end
 
         # --- Bind map building ---
+        #
+        # Predicate-driven: walks predicates to determine how many binds each
+        # contributes (0 for IS NULL/unboundable, 1 for scalar, 2 for BETWEEN,
+        # 1 array for HomogeneousIn). Then appends LIMIT/OFFSET from trailing
+        # binds. Returns nil if the derived count doesn't match actual binds.
 
         def build_bind_map_from_binds(binds)
           bind_map = []
-          pred_bind_index = 0
           preds = where_clause.predicates
-          pred_remaining_scalars = 0
+          expected_bind_count = 0
 
-          binds.each do |bind|
-            if bind.respond_to?(:name) && bind.name == "LIMIT"
-              bind_map << { source: :limit }
-              next
+          # Phase 1: Walk predicates to build the map
+          preds.each_with_index do |pred, pred_index|
+            entries = predicate_bind_entries(pred, pred_index)
+            return nil unless entries # uncacheable predicate
+            entries.each do |entry|
+              bind_map << entry
+              expected_bind_count += 1 unless entry[:extractor] == :none
             end
+          end
 
-            if bind.respond_to?(:name) && bind.name == "OFFSET"
-              bind_map << { source: :offset }
-              next
-            end
-
-            if bind.is_a?(Array)
-              bind_map << { source: :predicate, index: pred_bind_index, extractor: :array }
-              pred_bind_index += 1
-              next
-            end
-
-            if pred_remaining_scalars > 0
-              pred_remaining_scalars -= 1
-              bind_map << { source: :predicate, index: pred_bind_index, extractor: :between_right }
-              if pred_remaining_scalars == 0
-                pred_bind_index += 1
+          # Phase 2: Append LIMIT / OFFSET from the trailing binds
+          bind_tail_start = expected_bind_count
+          binds[bind_tail_start..].each do |bind|
+            if bind.respond_to?(:name)
+              case bind.name
+              when "LIMIT"
+                bind_map << { source: :limit }
+              when "OFFSET"
+                bind_map << { source: :offset }
+              else
+                return nil # unknown trailing bind
               end
-              next
-            end
-
-            pred = preds[pred_bind_index]
-            return nil unless pred
-
-            case pred
-            when Arel::Nodes::Between
-              bind_map << { source: :predicate, index: pred_bind_index, extractor: :between_left }
-              pred_remaining_scalars = 1
             else
-              bind_map << { source: :predicate, index: pred_bind_index, extractor: :scalar }
-              pred_bind_index += 1
+              return nil # unexpected trailing bind
             end
           end
 
           bind_map
+        end
+
+        # Returns an array of bind map entries for a single predicate,
+        # or nil if the predicate is uncacheable.
+        def predicate_bind_entries(pred, pred_index)
+          case pred
+          when Arel::Nodes::Equality, Arel::Nodes::NotEqual,
+               Arel::Nodes::IsNotDistinctFrom, Arel::Nodes::IsDistinctFrom
+            if pred.right.nil? || unboundable_value?(pred.right)
+              # IS NULL / IS NOT NULL / unboundable — emits zero binds
+              [{ source: :predicate, index: pred_index, extractor: :none }]
+            else
+              [{ source: :predicate, index: pred_index, extractor: :scalar }]
+            end
+          when Arel::Nodes::GreaterThan, Arel::Nodes::GreaterThanOrEqual,
+               Arel::Nodes::LessThan, Arel::Nodes::LessThanOrEqual
+            [{ source: :predicate, index: pred_index, extractor: :scalar }]
+          when Arel::Nodes::Between
+            [
+              { source: :predicate, index: pred_index, extractor: :between_left },
+              { source: :predicate, index: pred_index, extractor: :between_right }
+            ]
+          when Arel::Nodes::HomogeneousIn
+            [{ source: :predicate, index: pred_index, extractor: :array }]
+          when Arel::Nodes::Grouping
+            predicate_bind_entries(pred.expr, pred_index)
+          else
+            nil # uncacheable
+          end
         end
 
       # Collector that collapses add_binds (HomogeneousIn) into a single

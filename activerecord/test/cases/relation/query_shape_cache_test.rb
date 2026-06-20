@@ -493,4 +493,191 @@ module ActiveRecord
         shape
       end
   end
+
+  class QueryShapeCacheBugRegressionTest < ActiveRecord::TestCase
+    fixtures :posts, :comments, :authors, :topics
+
+    setup do
+      @original_max_size = ActiveRecord::Base.query_shape_cache_max_size
+      Post.query_shape_cache.clear
+      Comment.query_shape_cache.clear
+      Topic.query_shape_cache.clear
+    end
+
+    teardown do
+      ActiveRecord::Base.query_shape_cache_max_size = @original_max_size
+      if defined?(@original_prepared)
+        Post.lease_connection.instance_variable_set(:@prepared_statements, @original_prepared)
+      end
+      Post.query_shape_cache.clear
+      Comment.query_shape_cache.clear
+      Topic.query_shape_cache.clear
+    end
+
+    # --- Bug 1: Missing association_cache / aggregation_cache ivars ---
+
+    test "cache-hit records have working association access" do
+      skip_if_prepared_statements!
+
+      post = posts(:welcome)
+      Post.where(id: post.id).to_a # miss
+      result = Post.where(id: post.id).to_a # hit with plan
+
+      # This would blow up with "undefined method for nil" if @association_cache
+      # wasn't initialized
+      assert_nothing_raised do
+        result.first.comments
+      end
+    end
+
+    test "cache-hit records can be reloaded" do
+      skip_if_prepared_statements!
+
+      Post.where(id: posts(:welcome).id).to_a # miss
+      result = Post.where(id: posts(:welcome).id).to_a # hit
+
+      assert_nothing_raised do
+        result.first.reload
+      end
+      assert_equal posts(:welcome).title, result.first.title
+    end
+
+    # --- Bug 2a: Bind map desync with NULL predicates ---
+
+    test "where with nil and bound values returns correct results on cache hit" do
+      skip_if_prepared_statements!
+
+      Post.query_shape_cache.clear
+
+      # Create posts: one with nil author, one with author
+      p1 = Post.create!(title: "nil author", author_id: 0, body: "first")
+      p2 = Post.create!(title: "nil author2", author_id: 0, body: "second")
+
+      # Mix of IS NULL and bound predicate: where(type: nil, body: "first")
+      # type IS NULL emits 0 binds; body = ? emits 1 bind.
+      result1 = Post.where(type: nil, body: "first").to_a # miss
+      assert_includes result1.map(&:id), p1.id
+
+      # Cache hit — the body bind must not desync
+      result2 = Post.where(type: nil, body: "second").to_a # hit
+      assert_includes result2.map(&:id), p2.id
+      assert_not_includes result2.map(&:id), p1.id,
+        "Cache hit with NULL predicate should not confuse bind positions"
+    ensure
+      p1&.destroy
+      p2&.destroy
+    end
+
+    # --- Bug 2b: Single-element array collapse ---
+
+    test "where with single-element array returns correct result on cache hit" do
+      skip_if_prepared_statements!
+
+      Post.query_shape_cache.clear
+
+      # where(id: [X]) — Rails collapses to scalar =, but raw value is [X]
+      result1 = Post.where(id: [posts(:welcome).id]).to_a # miss
+      assert_equal [posts(:welcome).id], result1.map(&:id)
+
+      # Cache hit — must unwrap the single-element array correctly
+      result2 = Post.where(id: [posts(:thinking).id]).to_a # hit
+      assert_equal [posts(:thinking).id], result2.map(&:id),
+        "Single-element array should be unwrapped on cache hit"
+    end
+
+    test "where with Set returns correct result on cache hit" do
+      skip_if_prepared_statements!
+
+      Post.query_shape_cache.clear
+
+      result1 = Post.where(id: Set[posts(:welcome).id]).to_a # miss
+      assert_equal [posts(:welcome).id], result1.map(&:id)
+
+      result2 = Post.where(id: Set[posts(:thinking).id]).to_a # hit
+      assert_equal [posts(:thinking).id], result2.map(&:id),
+        "Single-element Set should be unwrapped on cache hit"
+    end
+
+    test "where with multi-element array uses IN and returns correct results" do
+      skip_if_prepared_statements!
+
+      Post.query_shape_cache.clear
+      ids1 = [posts(:welcome).id, posts(:thinking).id]
+      ids2 = [posts(:welcome).id]
+
+      result1 = Post.where(id: ids1).to_a # miss
+      assert_equal ids1.sort, result1.map(&:id).sort
+
+      result2 = Post.where(id: ids2).to_a # hit (different array length)
+      assert_equal ids2, result2.map(&:id)
+    end
+
+    # --- STI subclass direct query (implicit type predicate) ---
+
+    test "STI subclass direct query returns correct results on cache hit" do
+      skip_if_prepared_statements!
+
+      # StiPost < Post adds an implicit where(type: 'StiPost')
+      StiPost.query_shape_cache.clear
+
+      sp1 = StiPost.create!(title: "STI One", author_id: 1, body: "a")
+      sp2 = StiPost.create!(title: "STI Two", author_id: 2, body: "b")
+
+      result1 = StiPost.where(author_id: 1).to_a # miss
+      assert result1.all? { |r| r.is_a?(StiPost) }
+      assert_includes result1.map(&:id), sp1.id
+
+      result2 = StiPost.where(author_id: 2).to_a # hit
+      assert result2.all? { |r| r.is_a?(StiPost) }
+      assert_includes result2.map(&:id), sp2.id
+      assert_not_includes result2.map(&:id), sp1.id
+    ensure
+      sp1&.destroy
+      sp2&.destroy
+    end
+
+    # --- Cache-hit SQL matches uncached SQL ---
+
+    test "cache-hit SQL is identical to uncached SQL" do
+      skip_if_prepared_statements!
+
+      Post.query_shape_cache.clear
+
+      # Miss — capture the SQL
+      uncached_sql = nil
+      callback = ->(_name, _start, _finish, _id, payload) {
+        uncached_sql = payload[:sql] if payload[:sql]&.include?("posts")
+      }
+      ActiveSupport::Notifications.subscribed(callback, "sql.active_record") do
+        Post.where(author_id: 1).to_a
+      end
+
+      # Hit — capture the SQL
+      cached_sql = nil
+      callback2 = ->(_name, _start, _finish, _id, payload) {
+        cached_sql = payload[:sql] if payload[:sql]&.include?("posts")
+      }
+      ActiveSupport::Notifications.subscribed(callback2, "sql.active_record") do
+        Post.where(author_id: 2).to_a
+      end
+
+      # SQL should differ only in the bind value
+      assert uncached_sql.present?
+      assert cached_sql.present?
+      # Normalize bind values for comparison
+      normalized_uncached = uncached_sql.gsub(/= \d+/, "= ?")
+      normalized_cached = cached_sql.gsub(/= \d+/, "= ?")
+      assert_equal normalized_uncached, normalized_cached,
+        "Cached SQL shape should match uncached SQL shape"
+    end
+
+    private
+      def skip_if_prepared_statements!
+        if Post.lease_connection.prepared_statements
+          connection = Post.lease_connection
+          @original_prepared = connection.instance_variable_get(:@prepared_statements)
+          connection.instance_variable_set(:@prepared_statements, false)
+        end
+      end
+  end
 end
